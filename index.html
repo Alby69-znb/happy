@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lettore corale SATB</title>
+<style>
+:root{
+  --bg:#12141a; --panel:#1b1e27; --line:#2b3040; --text:#e9ecf3; --muted:#8c93a6; --accent:#7cc4ff;
+}
+@media (prefers-color-scheme: light){
+  :root{ --bg:#f4f5f8; --panel:#ffffff; --line:#d9dce5; --text:#1b1e27; --muted:#667085; --accent:#1769c2; }
+}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text)}
+header{padding:18px 20px 6px}
+h1{margin:0;font-size:20px}
+header p{margin:4px 0 0;color:var(--muted);font-size:13px}
+main{padding:12px 20px 28px;max-width:1200px;margin:0 auto}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+#drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted);cursor:pointer}
+#drop.over{border-color:var(--accent);color:var(--accent)}
+#drop b{color:var(--text)}
+button{font:inherit;color:var(--text);background:transparent;border:1px solid var(--line);border-radius:8px;padding:7px 14px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+button:disabled{opacity:.4;cursor:default}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.grow{flex:1;min-width:140px}
+input[type=range]{accent-color:var(--accent)}
+label.small{font-size:12px;color:var(--muted);display:flex;gap:6px;align-items:center}
+#time{font-variant-numeric:tabular-nums;color:var(--muted);min-width:96px;text-align:right}
+#status{font-size:13px;color:var(--muted);margin-top:8px;min-height:18px}
+#status.err{color:#e5484d}
+canvas{width:100%;height:340px;display:block;border-radius:8px;background:var(--bg);border:1px solid var(--line);cursor:pointer}
+.voice{display:grid;grid-template-columns:auto 96px auto auto 110px 1fr;gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
+.voice:first-child{border-top:0}
+.dot{width:12px;height:12px;border-radius:50%}
+.vname{font-weight:600}
+.tog{padding:3px 9px;font-size:12px}
+.tog.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.lyr{white-space:nowrap;overflow:hidden;font-size:15px;color:var(--muted)}
+.lyr .cur{font-weight:700;font-size:17px}
+.lyr .past{opacity:.55}
+@media (max-width:700px){
+  .voice{grid-template-columns:auto 1fr auto auto;}
+  .voice input[type=range]{grid-column:1/3}
+  .voice .lyr{grid-column:1/-1}
+}
+footer{color:var(--muted);font-size:12px;margin-top:10px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Lettore corale SATB</h1>
+  <p>Carica uno spartito a 4 voci (MusicXML, MXL o MIDI): ascolti le voci e vedi note e sillabe evidenziarsi in tempo reale.</p>
+</header>
+<main>
+  <div class="panel">
+    <div id="drop" tabindex="0"><b>Trascina qui il file</b> oppure clicca per sceglierlo<br><span style="font-size:12px">.musicxml · .xml · .mxl · .mid · .midi</span></div>
+    <input id="file" type="file" accept=".musicxml,.xml,.mxl,.mid,.midi" hidden>
+    <div class="row" style="margin-top:10px">
+      <button id="demoBtn">Prova con un brano d'esempio</button>
+      <span id="title" style="color:var(--muted)"></span>
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <button id="play" class="primary" disabled>▶ Play</button>
+      <button id="stop" disabled>■ Stop</button>
+      <input id="seek" class="grow" type="range" min="0" max="1000" value="0" disabled>
+      <span id="time">0:00 / 0:00</span>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label class="small">Tempo <input id="speed" type="range" min="40" max="150" value="100"><span id="speedv">100%</span></label>
+      <label class="small">Zoom <input id="zoom" type="range" min="20" max="200" value="70"></label>
+      <label class="small">Volume <input id="vol" type="range" min="0" max="100" value="60"></label>
+    </div>
+  </div>
+
+  <div class="panel"><canvas id="cv"></canvas></div>
+  <div class="panel" id="voices"></div>
+  <footer>Spazio = play/pausa · clic sul piano roll = vai a quel punto. Il lettore non contiene brani: i file che carichi restano nel tuo browser.</footer>
+</main>
+
+<script>
+"use strict";
+const COLORS=['#ff6b6b','#ffb347','#4cc9f0','#9b8cff','#5fd38d','#f78fb3','#c0c0c0','#e0d35a'];
+const $=s=>document.querySelector(s);
+let song=null, ctx=null, master=null, trackGains=[], playing=false, t0=0, pos0=0, speed=1, dragging=false;
+
+/* ---------- utilità ---------- */
+const dec=u8=>{try{return new TextDecoder('utf-8',{fatal:true}).decode(u8)}catch(e){return new TextDecoder('latin1').decode(u8)}};
+const fmt=s=>{s=Math.max(0,s);return Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0')};
+function setStatus(msg,err){const e=$('#status');e.textContent=msg||'';e.className=err?'err':''}
+
+/* ---------- tempo ---------- */
+function beatToSec(b){let s=0;const T=song.tempos;for(let i=0;i<T.length;i++){const nb=i+1<T.length?T[i+1].beat:Infinity;const seg=Math.min(b,nb)-T[i].beat;if(seg<=0)break;s+=seg*60/T[i].bpm;if(b<=nb)break}return s}
+function secToBeat(s){let acc=0;const T=song.tempos;for(let i=0;i<T.length;i++){const nb=i+1<T.length?T[i+1].beat:Infinity;const seg=(nb-T[i].beat)*60/T[i].bpm;if(nb===Infinity||s<=acc+seg)return T[i].beat+(s-acc)*T[i].bpm/60;acc+=seg}return 0}
+
+/* ---------- costruzione del brano ---------- */
+function buildSong(raw,tempos,title){
+  let tracks=raw.filter(t=>t.notes.length);
+  if(!tracks.length)throw new Error('Nessuna nota trovata nel file.');
+  tracks.forEach(t=>{t.notes.sort((a,b)=>a.start-b.start||a.midi-b.midi);t.avg=t.notes.reduce((s,n)=>s+n.midi,0)/t.notes.length});
+  if(tracks.length===4){tracks.sort((a,b)=>b.avg-a.avg);['Soprani','Contralti','Tenori','Bassi'].forEach((n,i)=>tracks[i].name=n)}
+  const sorted=tempos.slice().sort((a,b)=>a.beat-b.beat), T=[];
+  sorted.forEach(x=>{if(T.length&&Math.abs(T[T.length-1].beat-x.beat)<1e-6)T[T.length-1]=x;else T.push(x)});
+  if(!T.length)T.push({beat:0,bpm:100});
+  if(T[0].beat>0)T.unshift({beat:0,bpm:T[0].bpm});
+  song={tracks,tempos:T,title:title||''};
+  let minM=127,maxM=0,endB=0;
+  tracks.forEach((t,i)=>{
+    t.color=COLORS[i%COLORS.length];t.mute=false;t.solo=false;t.vol=1;
+    t.lyr=t.notes.filter(n=>n.lyric);
+    t.notes.forEach(n=>{n.s=beatToSec(n.start);n.e=beatToSec(n.start+n.dur);minM=Math.min(minM,n.midi);maxM=Math.max(maxM,n.midi);endB=Math.max(endB,n.start+n.dur)});
+    t.lyr.forEach(n=>{});
+    t.lyrIdx=-2;
+  });
+  song.minM=minM;song.maxM=maxM;song.endB=endB;song.total=beatToSec(endB);
+  stop();buildVoiceUI();
+  ['play','stop','seek'].forEach(id=>$('#'+id).disabled=false);
+  $('#title').textContent=song.title;
+  draw();
+}
+
+/* ---------- MusicXML ---------- */
+function parseMusicXML(text){
+  const doc=new DOMParser().parseFromString(text,'application/xml');
+  if(doc.querySelector('parsererror'))throw new Error('File XML non valido.');
+  if(!doc.querySelector('score-partwise'))throw new Error('Supportato solo MusicXML "partwise".');
+  const names={};
+  doc.querySelectorAll('part-list > score-part').forEach(sp=>{names[sp.getAttribute('id')]=(sp.querySelector('part-name')||{}).textContent||sp.getAttribute('id')});
+  const tracks=new Map(), tempos0=[], tempos1=[];
+  const parts=[...doc.querySelectorAll('score-partwise > part')];
+  parts.forEach((part,pi)=>{
+    let div=1,cursor=0;const open=new Map();
+    part.querySelectorAll(':scope > measure').forEach(m=>{
+      let maxPos=cursor, lastStart=cursor;
+      for(const el of m.children){
+        const tag=el.tagName;
+        if(tag==='attributes'){const d=el.querySelector('divisions');if(d)div=parseFloat(d.textContent)||1}
+        else if(tag==='direction'){const s=el.querySelector('sound[tempo]');if(s){(pi===0?tempos0:tempos1).push({beat:cursor,bpm:parseFloat(s.getAttribute('tempo'))})}}
+        else if(tag==='sound'&&el.hasAttribute('tempo')){(pi===0?tempos0:tempos1).push({beat:cursor,bpm:parseFloat(el.getAttribute('tempo'))})}
+        else if(tag==='backup'){cursor-=parseFloat(el.querySelector('duration').textContent)/div}
+        else if(tag==='forward'){cursor+=parseFloat(el.querySelector('duration').textContent)/div}
+        else if(tag==='note'){
+          if(el.querySelector('grace'))continue;
+          const durEl=el.querySelector('duration');const dur=durEl?parseFloat(durEl.textContent)/div:0;
+          const chord=!!el.querySelector('chord');
+          const start=chord?lastStart:cursor;
+          if(!chord)lastStart=cursor;
+          if(!el.querySelector('rest')){
+            const pe=el.querySelector('pitch');
+            if(pe){
+              const step=pe.querySelector('step').textContent;
+              const alter=parseFloat((pe.querySelector('alter')||{}).textContent||0);
+              const oct=parseInt(pe.querySelector('octave').textContent,10);
+              const midi=12*(oct+1)+({C:0,D:2,E:4,F:5,G:7,A:9,B:11})[step]+Math.round(alter);
+              const voice=(el.querySelector('voice')||{}).textContent||'1';
+              const key=pi+'-'+voice;
+              if(!tracks.has(key))tracks.set(key,{name:names[part.getAttribute('id')]||('Voce '+(tracks.size+1)),voice,notes:[],pi});
+              const tr=tracks.get(key);
+              const tStop=el.querySelector('tie[type="stop"]'),tStart=el.querySelector('tie[type="start"]');
+              const ok=key+'-'+midi;
+              if(tStop&&open.has(ok)){
+                const n=open.get(ok);n.dur+=dur;
+                if(!tStart)open.delete(ok);
+              }else{
+                const n={start,dur,midi,lyric:'',syl:'single'};
+                const ly=el.querySelector('lyric');
+                if(ly){
+                  const texts=[...ly.querySelectorAll('text')].map(x=>x.textContent).join('');
+                  n.lyric=texts;n.syl=((ly.querySelector('syllabic')||{}).textContent)||'single';
+                }
+                tr.notes.push(n);
+                if(tStart)open.set(ok,n);
+              }
+            }
+          }
+          if(!chord)cursor+=dur;
+        }
+        maxPos=Math.max(maxPos,cursor);
+      }
+      cursor=maxPos;
+    });
+  });
+  const list=[...tracks.values()];
+  const multi={};list.forEach(t=>{multi[t.pi]=(multi[t.pi]||0)+1});
+  list.forEach(t=>{if(multi[t.pi]>1)t.name+=' (v'+t.voice+')'});
+  const t=(doc.querySelector('work-title')||doc.querySelector('movement-title')||{}).textContent||'';
+  return buildSong(list,tempos0.length?tempos0:tempos1,t.trim());
+}
+
+/* ---------- MXL (zip) ---------- */
+async function inflateRaw(u8){
+  const ds=new DecompressionStream('deflate-raw');
+  const stream=new Blob([u8]).stream().pipeThrough(ds);
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+async function unzip(buf){
+  const dv=new DataView(buf),u8=new Uint8Array(buf);
+  let e=buf.byteLength-22;while(e>=0&&dv.getUint32(e,true)!==0x06054b50)e--;
+  if(e<0)throw new Error('Archivio MXL non valido.');
+  const n=dv.getUint16(e+10,true);let p=dv.getUint32(e+16,true);const files={};
+  for(let i=0;i<n;i++){
+    if(dv.getUint32(p,true)!==0x02014b50)break;
+    const method=dv.getUint16(p+10,true),cs=dv.getUint32(p+20,true);
+    const nl=dv.getUint16(p+28,true),xl=dv.getUint16(p+30,true),cl=dv.getUint16(p+32,true),lho=dv.getUint32(p+42,true);
+    const name=dec(u8.subarray(p+46,p+46+nl));
+    const ln=dv.getUint16(lho+26,true),lx=dv.getUint16(lho+28,true);
+    const start=lho+30+ln+lx;
+    files[name]={method,data:u8.subarray(start,start+cs)};
+    p+=46+nl+xl+cl;
+  }
+  return async name=>{const f=files[name];if(!f)return null;return f.method===0?f.data:await inflateRaw(f.data)};
+}
+async function parseMXL(buf){
+  const get=await unzip(buf);
+  const c=await get('META-INF/container.xml');
+  let root=null;
+  if(c){const d=new DOMParser().parseFromString(dec(c),'application/xml');const r=d.querySelector('rootfile');if(r)root=r.getAttribute('full-path')}
+  if(!root)throw new Error('File principale non trovato nell\'MXL.');
+  const x=await get(root);
+  return parseMusicXML(dec(x));
+}
+
+/* ---------- MIDI ---------- */
+function parseMIDI(buf){
+  const d=new DataView(buf);let p=0;
+  const str=n=>{let s='';for(let i=0;i<n;i++)s+=String.fromCharCode(d.getUint8(p+i));p+=n;return s};
+  const vlq=()=>{let v=0,b;do{b=d.getUint8(p++);v=(v<<7)|(b&127)}while(b&128);return v};
+  if(str(4)!=='MThd')throw new Error('File MIDI non valido.');
+  p+=4;p+=2;const nt=d.getUint16(p);const tpq=d.getUint16(p+2);p+=4;
+  if(tpq&0x8000)throw new Error('Tempo SMPTE non supportato.');
+  const tempos=[],chans=new Map(),lyrics=[];
+  for(let t=0;t<nt;t++){
+    if(str(4)!=='MTrk')throw new Error('Traccia MIDI non valida.');
+    const len=d.getUint32(p);p+=4;const end=p+len;
+    let tick=0,run=0,tname='';const open=new Map();
+    while(p<end){
+      tick+=vlq();
+      let st=d.getUint8(p);
+      if(st<128)st=run;else{p++;if(st<0xF0)run=st}
+      if(st===0xFF){
+        const type=d.getUint8(p++),l=vlq();const data=new Uint8Array(buf,p,l);p+=l;
+        if(type===0x51&&l===3)tempos.push({beat:tick/tpq,bpm:60000000/((data[0]<<16)|(data[1]<<8)|data[2])});
+        else if(type===0x03&&!tname)tname=dec(data);
+        else if(type===0x05)lyrics.push({t,tick,text:dec(data)});
+      }else if(st===0xF0||st===0xF7){const l=vlq();p+=l}
+      else{
+        const hi=st>>4,ch=st&15,a=d.getUint8(p++),b=(hi===0xC||hi===0xD)?0:d.getUint8(p++);
+        if(ch===9)continue;
+        const key=t+'-'+ch,ok=key+'-'+a;
+        if(hi===0x9&&b>0){open.set(ok,tick)}
+        else if(hi===0x8||(hi===0x9&&b===0)){
+          if(open.has(ok)){
+            const st0=open.get(ok);open.delete(ok);
+            if(!chans.has(key))chans.set(key,{name:tname||('Traccia '+(chans.size+1)),t,notes:[]});
+            chans.get(key).notes.push({start:st0/tpq,dur:Math.max(.05,(tick-st0)/tpq),midi:a,lyric:'',syl:'single',_tick:st0});
+          }
+        }
+      }
+    }
+    p=end;
+  }
+  const list=[...chans.values()];
+  lyrics.forEach(ly=>{
+    let txt=ly.text.replace(/^[\\\/]+/,'');
+    if(!txt.trim())return;
+    const trs=list.filter(x=>x.t===ly.t);
+    trs.forEach(tr=>{
+      const n=tr.notes.find(n=>n._tick===ly.tick&&!n.lyric);
+      if(n){const cont=/-$/.test(txt);n.lyric=txt.replace(/-$/,'').trim();n.syl=cont?'middle':'end'}
+    });
+  });
+  return buildSong(list,tempos,'');
+}
+
+/* ---------- brano d'esempio (originale, generato in codice) ---------- */
+function demoSong(){
+  const ch=[[72,67,64,48],[72,69,64,45],[72,69,65,41],[71,67,62,43],[72,67,64,48],[72,69,64,45],[72,69,65,41],[71,67,62,43]];
+  const syl=[['Can','begin'],['to','end'],['in','single'],['sie','begin'],['me','end'],['og','begin'],['gi','end'],['là','single']];
+  const names=['Soprani','Contralti','Tenori','Bassi'];
+  const raw=names.map((nm,v)=>({name:nm,notes:ch.map((c,i)=>({start:i*4,dur:4,midi:c[v],lyric:syl[i][0],syl:syl[i][1]}))}));
+  buildSong(raw,[{beat:0,bpm:80}],'Esempio (brano originale)');
+}
+
+/* ---------- caricamento file ---------- */
+async function loadFile(f){
+  try{
+    setStatus('Lettura di '+f.name+'…');
+    const ext=f.name.toLowerCase().split('.').pop();
+    if(ext==='mxl')await parseMXL(await f.arrayBuffer());
+    else if(ext==='mid'||ext==='midi')parseMIDI(await f.arrayBuffer());
+    else parseMusicXML(await f.text());
+    const nl=song.tracks.reduce((s,t)=>s+t.lyr.length,0);
+    setStatus(song.tracks.length+' voci caricate'+(nl?'':' (nessun testo trovato nel file: si vedono solo le note)')+'.');
+    if(!$('#title').textContent)$('#title').textContent=f.name;
+  }catch(e){setStatus(e.message||String(e),true)}
+}
+
+/* ---------- audio ---------- */
+function curPos(){return playing?pos0+Math.max(0,ctx.currentTime-t0)*speed:pos0}
+function audible(t){const any=song.tracks.some(x=>x.solo);return any?t.solo:!t.mute}
+function applyGains(){
+  if(!ctx||!song)return;
+  song.tracks.forEach((t,i)=>trackGains[i].gain.setTargetAtTime(audible(t)?t.vol:0,ctx.currentTime,.02));
+  master.gain.setTargetAtTime($('#vol').value/100,ctx.currentTime,.02);
+}
+function voiceNote(dest,midi,when,dur){
+  dur=Math.max(dur,.1);
+  const f=440*Math.pow(2,(midi-69)/12);
+  const o1=ctx.createOscillator(),o2=ctx.createOscillator(),g=ctx.createGain(),lp=ctx.createBiquadFilter();
+  o1.type='triangle';o2.type='sine';o1.frequency.value=f;o2.frequency.value=f;o2.detune.value=7;
+  lp.type='lowpass';lp.frequency.value=2200;
+  const rel=Math.min(.08,dur/3);
+  g.gain.setValueAtTime(0,when);
+  g.gain.linearRampToValueAtTime(.16,when+.03);
+  g.gain.setValueAtTime(.16,Math.max(when+.03,when+dur-rel));
+  g.gain.linearRampToValueAtTime(0,when+dur);
+  o1.connect(lp);o2.connect(lp);lp.connect(g);g.connect(dest);
+  o1.start(when);o2.start(when);o1.stop(when+dur+.03);o2.stop(when+dur+.03);
+}
+function play(){
+  if(!song||playing)return;
+  if(pos0>=song.total-.05)pos0=0;
+  ctx=new (window.AudioContext||window.webkitAudioContext)();
+  master=ctx.createGain();master.connect(ctx.destination);
+  trackGains=song.tracks.map(()=>{const g=ctx.createGain();g.connect(master);return g});
+  speed=$('#speed').value/100;
+  const now=ctx.currentTime+.06;t0=now;
+  song.tracks.forEach((tr,i)=>tr.notes.forEach(n=>{
+    if(n.e<=pos0)return;
+    const st=Math.max(n.s,pos0);
+    voiceNote(trackGains[i],n.midi,now+(st-pos0)/speed,(n.e-st)/speed);
+  }));
+  playing=true;applyGains();
+  $('#play').textContent='❚❚ Pausa';
+}
+function pause(){
+  if(!playing)return;
+  pos0=curPos();playing=false;
+  try{ctx.close()}catch(e){}
+  ctx=null;$('#play').textContent='▶ Play';
+}
+function stop(){
+  if(playing){playing=false;try{ctx.close()}catch(e){}ctx=null}
+  pos0=0;$('#play').textContent='▶ Play';
+  if(song)draw();
+}
+function seekTo(sec){
+  const was=playing;
+  if(was)pause();
+  pos0=Math.min(Math.max(0,sec),song.total);
+  if(was)play();else draw();
+}
+
+/* ---------- interfaccia voci ---------- */
+function buildVoiceUI(){
+  const box=$('#voices');box.innerHTML='';
+  song.tracks.forEach((t,i)=>{
+    const r=document.createElement('div');r.className='voice';
+    const dot=document.createElement('span');dot.className='dot';dot.style.background=t.color;
+    const nm=document.createElement('span');nm.className='vname';nm.textContent=t.name;
+    const m=document.createElement('button');m.className='tog';m.textContent='Muto';
+    const s=document.createElement('button');s.className='tog';s.textContent='Solo';
+    const v=document.createElement('input');v.type='range';v.min=0;v.max=100;v.value=100;
+    const l=document.createElement('div');l.className='lyr';
+    m.onclick=()=>{t.mute=!t.mute;m.classList.toggle('on',t.mute);applyGains()};
+    s.onclick=()=>{t.solo=!t.solo;s.classList.toggle('on',t.solo);applyGains()};
+    v.oninput=()=>{t.vol=v.value/100;applyGains()};
+    t.lyrEl=l;
+    r.append(dot,nm,m,s,v,l);box.appendChild(r);
+  });
+}
+function lyricText(prev,cur){
+  const base=cur.lyric||'';
+  return base+((cur.syl==='begin'||cur.syl==='middle')&&!/-$/.test(base)?'‑':'');
+}
+function updateLyrics(sec){
+  song.tracks.forEach(t=>{
+    let k=-1;const L=t.lyr;
+    for(let i=0;i<L.length;i++){if(L[i].s<=sec+1e-6)k=i;else break}
+    const active=k>=0&&sec<L[k].e;
+    const key=k+(active?'a':'p');
+    if(t.lyrKey===key)return;t.lyrKey=key;
+    const el=t.lyrEl;el.textContent='';
+    if(!L.length){el.textContent='(nessun testo nel file)';return}
+    for(let i=Math.max(0,k-2);i<=Math.min(L.length-1,k+5);i++){
+      const sp=document.createElement('span');
+      sp.textContent=lyricText(L[i-1],L[i]);
+      if(i===k&&active){sp.className='cur';sp.style.color=t.color}
+      else if(i<=k)sp.className='past';
+      el.appendChild(sp);
+      const joinNext=(L[i].syl==='begin'||L[i].syl==='middle');
+      el.appendChild(document.createTextNode(joinNext?'':' '));
+    }
+  });
+}
+
+/* ---------- piano roll ---------- */
+const cv=$('#cv'),g2=cv.getContext('2d');
+function sizeCanvas(){
+  const dpr=window.devicePixelRatio||1;
+  cv.width=Math.round(cv.clientWidth*dpr);cv.height=Math.round(cv.clientHeight*dpr);
+  g2.setTransform(dpr,0,0,dpr,0,0);
+}
+function cssVar(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim()}
+function draw(){
+  sizeCanvas();
+  const W=cv.clientWidth,H=cv.clientHeight;
+  g2.clearRect(0,0,W,H);
+  if(!song){g2.fillStyle=cssVar('--muted');g2.font='14px system-ui';g2.textAlign='center';g2.fillText('Carica uno spartito per vedere il piano roll',W/2,H/2);return}
+  const sec=curPos(),beat=secToBeat(sec),ppb=+$('#zoom').value;
+  const offset=Math.max(0,beat*ppb-W*.3);
+  const range=song.maxM-song.minM+3,top=14,rowH=(H-top-14)/range;
+  const y=m=>top+(song.maxM+1-m)*rowH;
+  const line=cssVar('--line'),muted=cssVar('--muted');
+  // griglia
+  g2.lineWidth=1;g2.strokeStyle=line;g2.fillStyle=muted;g2.font='10px system-ui';g2.textAlign='left';
+  for(let m=song.minM-1;m<=song.maxM+1;m++){
+    if(m%12===0){g2.beginPath();g2.moveTo(0,y(m)+rowH);g2.lineTo(W,y(m)+rowH);g2.stroke();g2.fillText('C'+(m/12-1),3,y(m)+rowH-2)}
+  }
+  const b0=Math.floor(offset/ppb),b1=Math.ceil((offset+W)/ppb);
+  for(let b=b0;b<=b1;b++){
+    const x=b*ppb-offset;
+    g2.strokeStyle=line;g2.globalAlpha=b%4===0?.9:.35;
+    g2.beginPath();g2.moveTo(x,top);g2.lineTo(x,H-14);g2.stroke();
+  }
+  g2.globalAlpha=1;
+  // note
+  const nh=Math.max(6,Math.min(rowH-1,24));
+  song.tracks.forEach(t=>{
+    const dim=!audible(t);
+    t.notes.forEach(n=>{
+      const x=n.start*ppb-offset,w=Math.max(3,n.dur*ppb-1);
+      if(x>W||x+w<0)return;
+      const yy=y(n.midi)+(rowH-nh)/2,act=sec>=n.s&&sec<n.e;
+      g2.globalAlpha=dim?.25:(act?1:.62);
+      g2.fillStyle=t.color;
+      g2.beginPath();g2.roundRect?g2.roundRect(x,yy,w,nh,4):g2.rect(x,yy,w,nh);g2.fill();
+      if(act&&!dim){g2.save();g2.globalAlpha=1;g2.lineWidth=2;g2.strokeStyle='#fff';g2.shadowColor=t.color;g2.shadowBlur=12;g2.stroke();g2.restore()}
+      if(n.lyric&&nh>=11){
+        g2.save();g2.beginPath();g2.rect(x,yy,w,nh);g2.clip();
+        g2.globalAlpha=dim?.5:1;g2.fillStyle='#10131a';
+        g2.font=(act?'bold ':'')+'11px system-ui';g2.textAlign='left';g2.textBaseline='middle';
+        g2.fillText(lyricText(null,n),x+4,yy+nh/2+.5);g2.restore();
+      }
+    });
+  });
+  g2.globalAlpha=1;g2.textBaseline='alphabetic';
+  // playhead
+  const px=beat*ppb-offset;
+  g2.strokeStyle=cssVar('--accent');g2.lineWidth=2;
+  g2.beginPath();g2.moveTo(px,0);g2.lineTo(px,H);g2.stroke();
+}
+function frame(){
+  if(song){
+    const sec=curPos();
+    if(playing&&sec>=song.total+.3){stop()}
+    const s=Math.min(curPos(),song.total);
+    if(!dragging)$('#seek').value=song.total?Math.round(s/song.total*1000):0;
+    $('#time').textContent=fmt(s)+' / '+fmt(song.total);
+    updateLyrics(s);
+    draw();
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ---------- eventi ---------- */
+const drop=$('#drop'),fileIn=$('#file');
+drop.onclick=()=>fileIn.click();
+drop.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();fileIn.click()}};
+fileIn.onchange=()=>{if(fileIn.files[0])loadFile(fileIn.files[0])};
+['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over')}));
+['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('over')}));
+drop.addEventListener('drop',e=>{if(e.dataTransfer.files[0])loadFile(e.dataTransfer.files[0])});
+$('#demoBtn').onclick=()=>{$('#title').textContent='';demoSong();setStatus('Brano d\'esempio caricato: 4 voci, testo e note.')};
+$('#play').onclick=()=>playing?pause():play();
+$('#stop').onclick=stop;
+$('#seek').oninput=e=>{dragging=true;if(song){$('#time').textContent=fmt(e.target.value/1000*song.total)+' / '+fmt(song.total)}};
+$('#seek').onchange=e=>{dragging=false;if(song)seekTo(e.target.value/1000*song.total)};
+$('#speed').oninput=e=>{$('#speedv').textContent=e.target.value+'%';if(playing){const p=curPos();pause();pos0=p;play()}};
+$('#vol').oninput=applyGains;
+cv.addEventListener('click',e=>{
+  if(!song)return;
+  const r=cv.getBoundingClientRect(),W=cv.clientWidth,ppb=+$('#zoom').value;
+  const beat=secToBeat(curPos()),offset=Math.max(0,beat*ppb-W*.3);
+  const b=(e.clientX-r.left+offset)/ppb;
+  seekTo(beatToSec(Math.max(0,b)));
+});
+document.addEventListener('keydown',e=>{
+  if(e.code==='Space'&&song&&!/INPUT|BUTTON|TEXTAREA/.test(document.activeElement.tagName)){e.preventDefault();playing?pause():play()}
+});
+window.addEventListener('resize',()=>{if(song)draw()});
+draw();requestAnimationFrame(frame);
+</script>
+</body>
+</html>
